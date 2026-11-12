@@ -15,7 +15,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C
 
 NAME=optimize-for-ssd
-VERSION=1.3
+VERSION=1.4
 CONF=/etc/$NAME.conf
 BACKUP_DIR=/var/backups/$NAME/$(date +%Y%m%d-%H%M%S)
 DRY_RUN=0 ASSUME_YES=0 STATUS_ONLY=0 FORCE=0 APPLY_LIST="" APT_UPDATED=0
@@ -682,15 +682,28 @@ ask_swap() {
       ram=$(ram_mib)
       [[ -n $ZRAM_SIZE ]] || ZRAM_SIZE="${ZRAM_PERCENT}%"
       while :; do
-        ui_input ZRAM_SIZE "zram swap size - a % of RAM or a size:\n\n   50%     2G     2GiB     1536M     1536MiB\n\nRAM in this VM: ${ram} MiB   (50% = $((ram / 2)) MiB)" "$ZRAM_SIZE" ''
+        if ((ASSUME_YES)); then
+          mib=$(size_to_mib "$ZRAM_SIZE" "$ram") && (( mib >= 64 && mib <= ram * 2 )) \
+            || die "ZRAM_SIZE '$ZRAM_SIZE' invalid (64 MiB .. 2x RAM = $((ram * 2)) MiB)"
+          ZRAM_MIB=$mib ZRAM_PCT=$(( mib * 100 / ram )); break
+        fi
+        # step 1: enter a value -> [Calculate] / [Quit]
+        ZRAM_SIZE=$(whiptail --title "$NAME - zram size" --ok-button "Calculate" --cancel-button "Quit" \
+          --inputbox "zram swap size - a % of RAM or a size:\n\n   50%     2G     2GiB     1536M     1536MiB\n\nRAM in this VM: ${ram} MiB" \
+          15 "$WT_W" "$ZRAM_SIZE" 3>&1 1>&2 2>&3) || quit_clean
         if ! mib=$(size_to_mib "$ZRAM_SIZE" "$ram") || (( mib < 64 || mib > ram * 2 )); then
-          ((ASSUME_YES)) && die "ZRAM_SIZE '$ZRAM_SIZE' invalid (64 MiB .. 2x RAM = $((ram * 2)) MiB)"
-          ui_msg "Can't use '$ZRAM_SIZE'.\n\nUse e.g. 50%, 2G or 1536M - between 64 MiB and $((ram * 2)) MiB (2x RAM)."
+          whiptail --title "$NAME - zram size" --ok-button "Back" \
+            --msgbox "Can't use '$ZRAM_SIZE'.\n\nUse e.g. 50%, 2G or 1536M - between 64 MiB and $((ram * 2)) MiB (2x RAM)." 11 "$WT_W" || true
           continue
         fi
         ZRAM_MIB=$mib ZRAM_PCT=$(( mib * 100 / ram ))
-        ((ASSUME_YES)) && break
-        if ui_yesno "zram swap size:\n\n   ${ZRAM_SIZE}  =  ${ZRAM_MIB} MiB  =  ${ZRAM_PCT}% of ${ram} MiB RAM\n$( ((ZRAM_PCT > 100)) && echo '\n(over 100% only pays off if data compresses well)' || true)\nUse this size? (No = edit it)" yes; then break; fi
+        # step 2: show the result -> [OK] / [Back]   (Esc = quit)
+        local rc=0
+        whiptail --title "$NAME - zram size" --yes-button "OK" --no-button "Back" \
+          --yesno "   You entered:  ${ZRAM_SIZE}\n\n   zram size:    ${ZRAM_MIB} MiB\n   share of RAM: ${ZRAM_PCT}% of ${ram} MiB$( ((ZRAM_PCT > 100)) && echo '\n\n   (over 100% only pays off if data compresses well)' || true)\n\n(Esc = quit without changing anything)" \
+          15 "$WT_W" || rc=$?
+        ((rc == 255)) && quit_clean
+        ((rc == 0)) && break
       done
       ui_radio ZRAM_ALGO "zram compression:" "$ZRAM_ALGO" zstd "best ratio (recommended)" lz4 "fastest" lzo-rle "kernel default"
       ui_input SWAPPINESS_ZRAM "vm.swappiness with zram only (zram is cheap: 100-180 is normal)" "$SWAPPINESS_ZRAM" '^([0-9]|[1-9][0-9]|1[0-9][0-9]|200)$'
