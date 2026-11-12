@@ -15,7 +15,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C
 
 NAME=optimize-for-ssd
-VERSION=1.1
+VERSION=1.2
 CONF=/etc/$NAME.conf
 BACKUP_DIR=/var/backups/$NAME/$(date +%Y%m%d-%H%M%S)
 DRY_RUN=0 ASSUME_YES=0 STATUS_ONLY=0 FORCE=0 APPLY_LIST="" APT_UPDATED=0
@@ -473,45 +473,54 @@ do_journal() {
 # ---------- ship ----------
 ask_ship() {
   SHIP_DO=1
-  local def=$VLOGS_URL base curl_ca=()
-  ((ASSUME_YES)) || def=${def:-http://192.168.1.6:9428/insert/journald}
+  local def=$VLOGS_URL base curl_tls=() code
+  ((ASSUME_YES)) || def=${def:-https://192.168.1.6:9443/insert/journald}
   ui_input VLOGS_URL "VictoriaLogs journald endpoint:" "$def" '^https?://[^/]+/.+$'
-  while :; do
-    ui_input VLOGS_CA "CA certificate file for HTTPS (e.g. your step-ca root).\nLeave empty for plain http or a publicly trusted cert." "$VLOGS_CA" ''
-    [[ -z $VLOGS_CA || -f $VLOGS_CA ]] && break
-    ((ASSUME_YES)) && die "CA file $VLOGS_CA not found"
-    ui_msg "File not found: $VLOGS_CA"
-  done
+  if [[ $VLOGS_URL == https://* ]]; then
+    while :; do
+      ui_input VLOGS_CA "HTTPS certificate check:\n\n  all   = encrypt, but don't verify the certificate (self-signed on IP)\n  /path = verify against this CA file (e.g. Caddy's or step-ca's root.crt)\n  empty = verify against the system CAs" "${VLOGS_CA:-all}" ''
+      [[ -z $VLOGS_CA || $VLOGS_CA == all || -f $VLOGS_CA ]] && break
+      ((ASSUME_YES)) && die "CA file $VLOGS_CA not found"
+      ui_msg "File not found: $VLOGS_CA"
+    done
+  else
+    VLOGS_CA=""
+  fi
   base=${VLOGS_URL%%/insert/*}
-  if [[ -n $VLOGS_CA ]]; then curl_ca=(--cacert "$VLOGS_CA"); fi
-  if ! curl -fsS --max-time 5 "${curl_ca[@]}" "$base/health" >/dev/null 2>&1; then
-    if ! ui_yesno "Can't reach $base/health from this VM.\n(firewall? IPsec rule? wrong IP?)\n\nConfigure shipping anyway? journal-upload retries and catches up later." no; then
-      SHIP_DO=0; PLAN+=("ship: skipped (VictoriaLogs unreachable)"); return
+  if [[ $VLOGS_CA == all ]]; then curl_tls=(-k); elif [[ -n $VLOGS_CA ]]; then curl_tls=(--cacert "$VLOGS_CA"); fi
+  # /insert must be allowed from this VM: an empty POST should get 2xx/4xx from VictoriaLogs, not 403 from the proxy
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${curl_tls[@]}" -X POST "$VLOGS_URL/upload" 2>/dev/null || echo 000)
+  if [[ $code == 000 || $code == 403 ]]; then
+    local why="can't reach $base"; [[ $code == 403 ]] && why="$base answered 403 - this VM's IP is probably not in the proxy's insert allow-list"
+    if ! ui_yesno "$why\n\nConfigure shipping anyway? journal-upload keeps retrying and catches up later." no; then
+      SHIP_DO=0; PLAN+=("ship: skipped ($why)"); return
     fi
   fi
-  PLAN+=("ship: systemd-journal-upload -> $VLOGS_URL")
+  PLAN+=("ship: systemd-journal-upload -> $VLOGS_URL$([[ $VLOGS_CA == all ]] && echo ' (TLS not verified)' || true), retry forever while the receiver is down")
 }
 do_ship() {
   ((SHIP_DO)) || return 0
-  local base=${VLOGS_URL%%/insert/*} curl_ca=() tag
-  if [[ -n $VLOGS_CA ]]; then curl_ca=(--cacert "$VLOGS_CA"); fi
   apt_install systemd-journal-remote
   {
     echo "[Upload]"
     echo "URL=$VLOGS_URL"
     if [[ -n $VLOGS_CA ]]; then echo "TrustedCertificateFile=$VLOGS_CA"; fi
   } | write_file "$UPLOAD_DROPIN"
+  # keep retrying while the receiver is down/restarting; it resumes from its saved cursor, so nothing is skipped
+  printf '[Unit]\nStartLimitIntervalSec=0\n\n[Service]\nRestart=always\nRestartSec=30\n' \
+    | write_file /etc/systemd/system/systemd-journal-upload.service.d/50-$NAME.conf
+  run systemctl daemon-reload
   run systemctl enable systemd-journal-upload
   run systemctl restart systemd-journal-upload
   if ((!DRY_RUN)); then
-    tag="$NAME-test-$(hostname)-$RANDOM"
-    logger -t "$NAME" "$tag"
-    info "sent test line '$tag', checking it arrived..."
-    sleep 6
-    if curl -fsS --max-time 10 "${curl_ca[@]}" "$base/select/logsql/query" --data-urlencode "query=_time:5m \"$tag\"" 2>/dev/null | grep -q "$tag"; then
-      ok "test log line visible in VictoriaLogs"
+    logger -t "$NAME" "journal shipping configured on $(hostname)"
+    sleep 8
+    if systemctl is-active -q systemd-journal-upload && \
+       ! journalctl -u systemd-journal-upload --since "-15s" --no-pager -q 2>/dev/null | grep -qiE 'fail|error|refused|denied|certificate'; then
+      ok "journal-upload running, no errors (first run sends the whole existing journal)"
     else
-      warn "test line not found yet - the first upload sends the whole existing journal and can take a while. Check: journalctl -u systemd-journal-upload"
+      warn "journal-upload reports problems:"
+      journalctl -u systemd-journal-upload --since "-30s" --no-pager -q 2>/dev/null | tail -5 | sed 's/^/      /'
     fi
   fi
   SUMMARY+=("shipping journal -> $VLOGS_URL")
