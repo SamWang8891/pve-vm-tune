@@ -280,7 +280,9 @@ st_rsyslog() { if pkg_installed rsyslog; then echo "todo|rsyslog installed"; els
 st_journal() { local m; m=$(journal_mode_now); if [[ $m == none ]]; then echo "todo|journald defaults"; else echo "done|$m"; fi; }
 st_ship() {
   if [[ -f $UPLOAD_DROPIN ]] && systemctl is-enabled -q systemd-journal-upload 2>/dev/null; then
-    echo "done|$(sed -n 's/^URL=//p' "$UPLOAD_DROPIN")"
+    if systemctl is-active -q systemd-journal-upload; then
+      echo "done|$(sed -n 's/^URL=//p' "$UPLOAD_DROPIN")"
+    else echo "todo|configured but not running (journalctl -u systemd-journal-upload)"; fi
   else echo "todo|not shipping"; fi
 }
 st_docker() {
@@ -520,7 +522,17 @@ do_ship() {
   {
     echo "[Upload]"
     echo "URL=$VLOGS_URL"
-    if [[ -n $VLOGS_CA ]]; then echo "TrustedCertificateFile=$VLOGS_CA"; fi
+    if [[ $VLOGS_URL == https://* ]]; then
+      # on https it loads a client cert from /etc/ssl/{private,certs}/journal-upload.pem
+      # unless both are '-'; the receiver doesn't use client certs
+      echo "ServerKeyFile=-"
+      echo "ServerCertificateFile=-"
+      case $VLOGS_CA in
+        all) echo "TrustedCertificateFile=-" ;;  # the config file takes '-', 'all' is CLI-only
+        "")  echo "TrustedCertificateFile=/etc/ssl/certs/ca-certificates.crt" ;;  # default is /etc/ssl/ca/trusted.pem
+        *)   echo "TrustedCertificateFile=$VLOGS_CA" ;;
+      esac
+    fi
   } | write_file "$UPLOAD_DROPIN"
   # keep retrying while the receiver is down/restarting; it resumes from its saved cursor, so nothing is skipped
   printf '[Unit]\nStartLimitIntervalSec=0\n\n[Service]\nRestart=always\nRestartSec=30\n' \
