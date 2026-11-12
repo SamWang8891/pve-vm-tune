@@ -247,7 +247,9 @@ ui_msg() {
   if ((ASSUME_YES)); then printf '%s\n' "$1" | sed 's/^/    /'; else whiptail --title "$NAME" --msgbox "$1" 18 "$WT_W" || true; fi
 }
 
-# ---------- state detection: each st_* prints "state|detail" (done/todo/n/a) ----------
+# ---------- state detection: each st_* prints "state|detail" ----------
+#   done = applied and in effect      part = applied, but not (fully) in effect - detail says why
+#   todo = not applied                n/a  = doesn't apply to this machine
 journal_mode_now() {
   if pkg_installed log2ram; then echo log2ram; return; fi
   if [[ -f $JD ]]; then
@@ -277,46 +279,104 @@ root_discard_ok() {
 }
 
 st_rsyslog() { if pkg_installed rsyslog; then echo "todo|rsyslog installed"; else echo "done|rsyslog not installed"; fi; }
-st_journal() { local m; m=$(journal_mode_now); if [[ $m == none ]]; then echo "todo|journald defaults"; else echo "done|$m"; fi; }
+st_journal() {
+  local m; m=$(journal_mode_now)
+  case $m in
+    none) echo "todo|journald defaults" ;;
+    log2ram)
+      if ! findmnt -n /var/log >/dev/null 2>&1; then echo "part|log2ram installed, /var/log not in RAM until reboot"
+      elif [[ ! -f $JD ]]; then echo "part|log2ram on, but journal size not capped"
+      else echo "done|log2ram $(findmnt -rno SIZE /var/log 2>/dev/null || true)"; fi ;;
+    *) echo "done|$m" ;;
+  esac
+}
 st_ship() {
-  if [[ -f $UPLOAD_DROPIN ]] && systemctl is-enabled -q systemd-journal-upload 2>/dev/null; then
-    if systemctl is-active -q systemd-journal-upload; then
-      echo "done|$(sed -n 's/^URL=//p' "$UPLOAD_DROPIN")"
-    else echo "todo|configured but not running (journalctl -u systemd-journal-upload)"; fi
-  else echo "todo|not shipping"; fi
+  [[ -f $UPLOAD_DROPIN ]] || { echo "todo|not shipping"; return; }
+  local url; url=$(sed -n 's/^URL=//p' "$UPLOAD_DROPIN")
+  if ! systemctl is-enabled -q systemd-journal-upload 2>/dev/null; then echo "part|configured, but service not enabled"
+  elif [[ $url == https://* ]] && ! grep -q '^ServerKeyFile=-' "$UPLOAD_DROPIN"; then echo "part|old config (asks for a client cert) - re-apply"
+  elif ! systemctl is-active -q systemd-journal-upload; then echo "part|not running - see journalctl -u systemd-journal-upload"
+  elif journalctl -u systemd-journal-upload --since -2min -q --no-pager 2>/dev/null | grep -qi 'failed'; then
+    echo "part|upload failing - see journalctl -u systemd-journal-upload"
+  else echo "done|$url"; fi
 }
 st_docker() {
   docker_present || { echo "n/a|docker not installed"; return; }
-  local d; d=$(docker_driver_now)
-  case $d in journald|local) echo "done|log-driver $d";; *) echo "todo|log-driver ${d:-json-file (default)}";; esac
+  local d live old
+  d=$(docker_driver_now)
+  case $d in journald|local) ;; *) echo "todo|log-driver ${d:-json-file (default)}"; return ;; esac
+  live=$(timeout 5 docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)
+  if [[ -n $live && $live != "$d" ]]; then echo "part|daemon.json says $d, docker still uses $live (restart docker)"; return; fi
+  # running containers keep the driver they were created with
+  old=$(timeout 10 docker ps -q 2>/dev/null | xargs -r timeout 10 docker inspect -f '{{.Name}} {{.HostConfig.LogConfig.Type}}' 2>/dev/null \
+        | awk '$2 == "json-file" {sub(/^\//, "", $1); printf "%s ", $1}' || true)
+  if [[ -n $old ]]; then echo "part|still json-file, recreate: ${old% }"; return; fi
+  echo "done|log-driver $d"
 }
 st_weblog() {
-  local any=0 done=1
-  if has_cmd nginx; then any=1; grep -qs "$NGINX_VAR" /etc/nginx/nginx.conf || done=0; fi
-  if has_cmd apache2ctl; then any=1; [[ -e /etc/apache2/conf-enabled/$APACHE_CONF_NAME.conf ]] || done=0; fi
-  if ((!any)); then echo "n/a|no nginx/apache"; elif ((done)); then echo "done|buffered"; else echo "todo|unbuffered"; fi
+  local any=0 on=0 miss=() f
+  if has_cmd nginx; then
+    any=1
+    if grep -qs "$NGINX_VAR" /etc/nginx/nginx.conf; then
+      on=1
+      for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+        [[ -f $f ]] || continue
+        if grep -E '^\s*access_log\s' "$f" | grep -vqE 'buffer=|\soff\s*;'; then miss+=("$(basename "$f")"); fi
+      done
+    else miss+=("nginx"); fi
+  fi
+  if has_cmd apache2ctl; then
+    any=1
+    if [[ -e /etc/apache2/conf-enabled/$APACHE_CONF_NAME.conf ]]; then
+      on=1
+      for f in /etc/apache2/sites-enabled/*.conf; do
+        [[ -e $f ]] || continue
+        if grep -E '^\s*CustomLog\s' "$f" | grep -vq 'env='; then miss+=("$(basename "$f")"); fi
+      done
+    else miss+=("apache"); fi
+  fi
+  if ((!any)); then echo "n/a|no nginx/apache"
+  elif ((!on)); then echo "todo|unbuffered"
+  elif ((${#miss[@]})); then echo "part|unbuffered access log in: ${miss[*]}"
+  else echo "done|buffered"; fi
 }
 st_swap() {
-  local m; m=$(swap_mode_now)
-  if [[ $m == none ]]; then echo "todo|$(swap_disk_list | tr '\n' ' ')swappiness=$(cat /proc/sys/vm/swappiness)"
-  else echo "done|$m, swappiness=$(cat /proc/sys/vm/swappiness)"; fi
+  local disk fst sw want size
+  disk=$(swap_disk_list | tr '\n' ' '); disk=${disk% }
+  fst=$(awk '$1 !~ /^#/ && $3 == "swap" {printf "%s ", $1}' /etc/fstab); fst=${fst% }
+  sw=$(cat /proc/sys/vm/swappiness)
+  want=$(sed -n 's/^vm.swappiness=//p' "$SWAP_SYSCTL" 2>/dev/null || true)
+  if zram_active; then
+    size=$(swapon --show=NAME,SIZE --noheadings --raw 2>/dev/null | awk '$1 ~ /^\/dev\/zram/ {print $2; exit}')
+    if [[ -n $disk ]]; then echo "part|zram on, but disk swap still active: $disk"
+    elif [[ -n $fst ]]; then echo "part|zram on, but disk swap comes back at boot (fstab: $fst)"
+    elif pkg_installed zram-tools && ! systemctl is-enabled -q zramswap 2>/dev/null; then echo "part|zram on, but zramswap not enabled at boot"
+    elif [[ -n $want && $want != "$sw" ]]; then echo "part|zram on, swappiness=$sw (configured $want)"
+    else echo "done|zram $size, swappiness=$sw"; fi
+  elif pkg_installed zram-tools && systemctl is-enabled -q zramswap 2>/dev/null; then
+    echo "part|zramswap enabled, but no zram swap active (systemctl status zramswap)"
+  elif [[ -n $want ]]; then
+    if [[ $want != "$sw" ]]; then echo "part|swappiness=$sw (configured $want)"; else echo "done|disk swap, swappiness=$sw"; fi
+  else echo "todo|${disk:+$disk, }swappiness=$sw"; fi
 }
 st_fstab() {
-  local o fs; o=$(root_fstab_opts); fs=$(findmnt -no FSTYPE / 2>/dev/null || echo ?)
-  if [[ ,$o, == *,noatime,* ]] && { [[ $fs != ext4 ]] || [[ $o == *commit=* ]]; }; then echo "done|$o"
+  local o fs live; o=$(root_fstab_opts); fs=$(findmnt -no FSTYPE / 2>/dev/null || echo ?)
+  live=$(findmnt -no OPTIONS / 2>/dev/null || true)
+  if [[ ,$o, == *,noatime,* ]] && { [[ $fs != ext4 ]] || [[ $o == *commit=* ]]; }; then
+    if [[ ,$live, == *,noatime,* ]]; then echo "done|$o"; else echo "part|in fstab, not active until remount/reboot"; fi
   else echo "todo|${o:-no / entry} ($fs)"; fi
 }
 st_trim() {
   local t=0; systemctl is-enabled -q fstrim.timer 2>/dev/null && t=1
   if ((t)) && root_discard_ok; then echo "done|timer on, discard supported"
-  elif ((t)); then echo "todo|timer on, but virtual disk has no discard"
+  elif ((t)); then echo "part|timer on, but virtual disk has no discard (PVE: Discard, then VM stop/start)"
   else echo "todo|fstrim.timer disabled"; fi
 }
 st_tmp() {
   if [[ $(findmnt -no FSTYPE /tmp 2>/dev/null) == tmpfs ]]; then
-    echo "done|tmpfs $(findmnt -no SIZE /tmp 2>/dev/null || true)"
+    echo "done|tmpfs $(findmnt -rno SIZE /tmp 2>/dev/null || true)"
   elif awk '$1 !~ /^#/ && $2 == "/tmp" && $3 == "tmpfs" {f=1} END {exit !f}' /etc/fstab; then
-    echo "done|in fstab, reboot pending"
+    echo "part|in fstab, tmpfs from next reboot"
   else echo "todo|on disk"; fi
 }
 
@@ -325,7 +385,7 @@ print_status() {
   printf '\n%s%-8s %-5s %-48s %s%s\n' "$D" ITEM STATE DESCRIPTION DETAIL "$N"
   for k in "${ITEMS[@]}"; do
     IFS='|' read -r s d < <("st_$k")
-    case $s in done) c=$G;; todo) c=$Y;; *) c=$D;; esac
+    case $s in done) c=$G;; part) c=$Y;; todo) c='';; *) c=$D;; esac
     printf '%-8s %s%-5s%s %-48s %s\n' "$k" "$c" "$s" "$N" "${DESC[$k]}" "$d"
   done
   echo
@@ -338,13 +398,14 @@ select_items() {
     case $s in
       n/a)  continue ;;
       done) label="[DONE] ${DESC[$k]} ($d)" ;;
+      part) label="[PART] $d" ;;           # the reason matters more than the description here
       *)    label="[    ] ${DESC[$k]}" ;;
     esac
     args+=("$k" "${label:0:$((WT_W - 20))}" OFF)
   done
   SELECTED=$(whiptail --title "$NAME $VERSION - $(hostname)" --ok-button "Next" --cancel-button "Quit" \
     --separate-output --checklist \
-    "SPACE toggles, ENTER = Next. [DONE] = already applied; tick it to re-apply.\nNothing changes until you confirm the plan at the end. Quit / Esc = exit now." \
+    "SPACE toggles, ENTER = Next. [DONE] = in effect. [PART] = applied, but not\nfully in effect yet (reason shown). Tick either to re-apply.\nNothing changes until you confirm the plan at the end. Quit / Esc = exit now." \
     22 "$WT_W" 10 "${args[@]}" 3>&1 1>&2 2>&3) || quit_clean
 }
 
