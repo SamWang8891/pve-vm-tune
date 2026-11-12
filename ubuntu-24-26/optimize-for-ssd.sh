@@ -15,7 +15,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C
 
 NAME=optimize-for-ssd
-VERSION=1.2
+VERSION=1.3
 CONF=/etc/$NAME.conf
 BACKUP_DIR=/var/backups/$NAME/$(date +%Y%m%d-%H%M%S)
 DRY_RUN=0 ASSUME_YES=0 STATUS_ONLY=0 FORCE=0 APPLY_LIST="" APT_UPDATED=0
@@ -35,14 +35,16 @@ DOCKER_DRIVER=journald
 DOCKER_RESTART=yes
 DOCKER_RECREATE=no
 SWAP_MODE=zram
-ZRAM_PERCENT=50
+ZRAM_PERCENT=50          # legacy (v1.0-1.2 configs); ZRAM_SIZE wins when set
+ZRAM_SIZE=""             # e.g. 50%, 2G, 2GiB, 1536M, 1536MiB
+ZRAM_MIB=0 ZRAM_PCT=0
 ZRAM_ALGO=zstd
 SWAPPINESS_ZRAM=100
 SWAPPINESS_DISK=10
 COMMIT_SEC=60
 TMP_SIZE=1G
 CONF_VARS=(JOURNAL_MODE L2R_SIZE_MB L2R_SYNC_HOURS VOLATILE_MAX DISK_MAX VLOGS_URL VLOGS_CA
-           DOCKER_DRIVER DOCKER_RESTART DOCKER_RECREATE SWAP_MODE ZRAM_PERCENT ZRAM_ALGO
+           DOCKER_DRIVER DOCKER_RESTART DOCKER_RECREATE SWAP_MODE ZRAM_SIZE ZRAM_ALGO
            SWAPPINESS_ZRAM SWAPPINESS_DISK COMMIT_SEC TMP_SIZE)
 
 # per-run decisions made during the question phase
@@ -185,6 +187,20 @@ fstab_ok() {   # fstab_ok CONTENT - validate a candidate fstab
 }
 
 mb_of() { du -sm "$@" 2>/dev/null | awk '{s += $1} END {print s + 0}'; }
+
+ram_mib() { awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo; }
+
+# size_to_mib "50%"|"2G"|"2GiB"|"1536M"|"1536MiB" RAM_MIB -> prints MiB (integer)
+size_to_mib() {
+  local v=${1,,} n u; v=${v// /}
+  [[ $v =~ ^([0-9]+([.][0-9]+)?)(%|m|mb|mib|g|gb|gib)$ ]] || return 1
+  n=${BASH_REMATCH[1]} u=${BASH_REMATCH[3]}
+  case $u in
+    %)        awk -v n="$n" -v r="$2" 'BEGIN {printf "%d\n", n * r / 100}' ;;
+    m|mb|mib) awk -v n="$n"           'BEGIN {printf "%d\n", n}' ;;
+    *)        awk -v n="$n"           'BEGIN {printf "%d\n", n * 1024}' ;;
+  esac
+}
 
 # ---------- UI (whiptail, or saved answers with --yes) ----------
 WT_W=$(( $(tput cols 2>/dev/null || echo 80) - 6 )); ((WT_W > 100)) && WT_W=100; ((WT_W < 60)) && WT_W=60
@@ -662,11 +678,24 @@ ask_swap() {
   fi
   case $SWAP_MODE in
     zram)
-      ui_input ZRAM_PERCENT "zram swap size as % of RAM (RAM: $(free -h | awk '/^Mem:/ {print $2}'))" "$ZRAM_PERCENT" '^([1-9][0-9]?|100)$'
+      local ram mib
+      ram=$(ram_mib)
+      [[ -n $ZRAM_SIZE ]] || ZRAM_SIZE="${ZRAM_PERCENT}%"
+      while :; do
+        ui_input ZRAM_SIZE "zram swap size - a % of RAM or a size:\n\n   50%     2G     2GiB     1536M     1536MiB\n\nRAM in this VM: ${ram} MiB   (50% = $((ram / 2)) MiB)" "$ZRAM_SIZE" ''
+        if ! mib=$(size_to_mib "$ZRAM_SIZE" "$ram") || (( mib < 64 || mib > ram * 2 )); then
+          ((ASSUME_YES)) && die "ZRAM_SIZE '$ZRAM_SIZE' invalid (64 MiB .. 2x RAM = $((ram * 2)) MiB)"
+          ui_msg "Can't use '$ZRAM_SIZE'.\n\nUse e.g. 50%, 2G or 1536M - between 64 MiB and $((ram * 2)) MiB (2x RAM)."
+          continue
+        fi
+        ZRAM_MIB=$mib ZRAM_PCT=$(( mib * 100 / ram ))
+        ((ASSUME_YES)) && break
+        if ui_yesno "zram swap size:\n\n   ${ZRAM_SIZE}  =  ${ZRAM_MIB} MiB  =  ${ZRAM_PCT}% of ${ram} MiB RAM\n$( ((ZRAM_PCT > 100)) && echo '\n(over 100% only pays off if data compresses well)' || true)\nUse this size? (No = edit it)" yes; then break; fi
+      done
       ui_radio ZRAM_ALGO "zram compression:" "$ZRAM_ALGO" zstd "best ratio (recommended)" lz4 "fastest" lzo-rle "kernel default"
       ui_input SWAPPINESS_ZRAM "vm.swappiness with zram only (zram is cheap: 100-180 is normal)" "$SWAPPINESS_ZRAM" '^([0-9]|[1-9][0-9]|1[0-9][0-9]|200)$'
       local disk; disk=$(swap_disk_list | tr '\n' ' ')
-      PLAN+=("swap: zram ${ZRAM_PERCENT}% $ZRAM_ALGO, swappiness=$SWAPPINESS_ZRAM, remove disk swap: ${disk:-none}")
+      PLAN+=("swap: zram ${ZRAM_MIB} MiB (${ZRAM_PCT}% of RAM) $ZRAM_ALGO, swappiness=$SWAPPINESS_ZRAM, remove disk swap: ${disk:-none}")
       ;;
     swappiness)
       ui_input SWAPPINESS_DISK "vm.swappiness with disk swap (lower = swap less; 10 is typical)" "$SWAPPINESS_DISK" '^([0-9]|[1-9][0-9]|100)$'
@@ -701,14 +730,18 @@ do_swap() {
     zram)
       if [[ -f /etc/systemd/zram-generator.conf ]]; then warn "zram-generator config found - may conflict with zram-tools"; fi
       apt_install zram-tools
-      set_kv /etc/default/zramswap ALGO "$ZRAM_ALGO" PERCENT "$ZRAM_PERCENT" PRIORITY 100
+      # SIZE is in MiB; PERCENT would override it, so comment PERCENT out
+      set_kv /etc/default/zramswap ALGO "$ZRAM_ALGO" SIZE "$ZRAM_MIB" PRIORITY 100
+      if grep -Eq '^[[:space:]]*PERCENT=' /etc/default/zramswap 2>/dev/null; then
+        sed -E 's/^([[:space:]]*)PERCENT=/#\1PERCENT=/' /etc/default/zramswap | write_file /etc/default/zramswap
+      fi
       run systemctl enable zramswap
       run systemctl restart zramswap
       if ((!DRY_RUN)) && ! zram_active; then warn "zram swap didn't come up - disk swap left untouched (systemctl status zramswap)"; return; fi
       remove_disk_swap
       printf 'vm.swappiness=%s\n' "$SWAPPINESS_ZRAM" | write_file "$SWAP_SYSCTL"
       run sysctl -q -w "vm.swappiness=$SWAPPINESS_ZRAM"
-      SUMMARY+=("swap: zram ${ZRAM_PERCENT}% $ZRAM_ALGO, disk swap removed, swappiness=$SWAPPINESS_ZRAM")
+      SUMMARY+=("swap: zram ${ZRAM_MIB} MiB (${ZRAM_PCT}%) $ZRAM_ALGO, disk swap removed, swappiness=$SWAPPINESS_ZRAM")
       ;;
     swappiness)
       printf 'vm.swappiness=%s\n' "$SWAPPINESS_DISK" | write_file "$SWAP_SYSCTL"
