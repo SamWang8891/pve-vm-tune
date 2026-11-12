@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # optimize-for-ssd.sh - reduce SSD wear from Ubuntu 24.04 / 26.04 LTS guests (e.g. Proxmox VMs)
 #
-#   sudo ./optimize-for-ssd.sh                 interactive selector (whiptail)
-#   sudo ./optimize-for-ssd.sh --status        show what is applied, change nothing
-#   sudo ./optimize-for-ssd.sh --dry-run       walk through everything, show diffs, change nothing
-#   sudo ./optimize-for-ssd.sh --yes --apply rsyslog,journal,ship --config ./ssd-tune.conf
-#                                      non-interactive (answers from the config file)
+#   sudo ./optimize-for-ssd.sh              interactive: pick items, answer questions, review plan, apply
+#   sudo ./optimize-for-ssd.sh --status     show what is applied, change nothing
+#   sudo ./optimize-for-ssd.sh --dry-run    same flow, but only show what would change
+#   sudo ./optimize-for-ssd.sh --yes --apply rsyslog,journal,ship --config ./optimize-for-ssd.conf
+#                                           non-interactive (answers from the config file)
 #
 # Items: rsyslog journal ship docker weblog swap fstab trim tmp
-# Every changed file is backed up to /var/backups/ssd-tune/<timestamp>/ first.
+# Nothing is changed until you confirm the plan. Quit / Esc / Ctrl+C before that = no changes.
+# Every changed file is backed up to /var/backups/optimize-for-ssd/<timestamp>/ first.
 
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C
 
-VERSION=1.0
-CONF=/etc/ssd-tune.conf
-BACKUP_DIR=/var/backups/ssd-tune/$(date +%Y%m%d-%H%M%S)
+NAME=optimize-for-ssd
+VERSION=1.1
+CONF=/etc/$NAME.conf
+BACKUP_DIR=/var/backups/$NAME/$(date +%Y%m%d-%H%M%S)
 DRY_RUN=0 ASSUME_YES=0 STATUS_ONLY=0 FORCE=0 APPLY_LIST="" APT_UPDATED=0
-REBOOT_REASONS=() SUMMARY=()
+PHASE=ask
+REBOOT_REASONS=() SUMMARY=() PLAN=()
 declare -A WRITTEN=()
 
 # ---------- defaults (overridden by the saved config) ----------
@@ -29,6 +32,7 @@ DISK_MAX=200M
 VLOGS_URL=""
 VLOGS_CA=""
 DOCKER_DRIVER=journald
+DOCKER_RESTART=yes
 DOCKER_RECREATE=no
 SWAP_MODE=zram
 ZRAM_PERCENT=50
@@ -38,17 +42,27 @@ SWAPPINESS_DISK=10
 COMMIT_SEC=60
 TMP_SIZE=1G
 CONF_VARS=(JOURNAL_MODE L2R_SIZE_MB L2R_SYNC_HOURS VOLATILE_MAX DISK_MAX VLOGS_URL VLOGS_CA
-           DOCKER_DRIVER DOCKER_RECREATE SWAP_MODE ZRAM_PERCENT ZRAM_ALGO SWAPPINESS_ZRAM
-           SWAPPINESS_DISK COMMIT_SEC TMP_SIZE)
+           DOCKER_DRIVER DOCKER_RESTART DOCKER_RECREATE SWAP_MODE ZRAM_PERCENT ZRAM_ALGO
+           SWAPPINESS_ZRAM SWAPPINESS_DISK COMMIT_SEC TMP_SIZE)
+
+# per-run decisions made during the question phase
+RSYS_DO=0 RSYS_DEL_OLD=no
+JOURNAL_DO=0 L2R_VACUUM=no JOURNAL_DEL_OLD=no
+SHIP_DO=0
+SWAP_DO=0
+FSTAB_DO=0
+DOCKER_DO=0
 
 # ---------- paths ----------
-JD=/etc/systemd/journald.conf.d/50-ssd-tune.conf
-UPLOAD_DROPIN=/etc/systemd/journal-upload.conf.d/50-ssd-tune.conf
-L2R_TIMER_DROPIN=/etc/systemd/system/log2ram-daily.timer.d/50-ssd-tune.conf
+JD=/etc/systemd/journald.conf.d/50-$NAME.conf
+UPLOAD_DROPIN=/etc/systemd/journal-upload.conf.d/50-$NAME.conf
+L2R_TIMER_DROPIN=/etc/systemd/system/log2ram-daily.timer.d/50-$NAME.conf
 DOCKER_JSON=/etc/docker/daemon.json
-SWAP_SYSCTL=/etc/sysctl.d/99-ssd-tune-swap.conf
-NGINX_MAP=/etc/nginx/conf.d/ssd-tune-logs.conf
-APACHE_SNIP=/etc/apache2/conf-available/ssd-tune-logs.conf
+SWAP_SYSCTL=/etc/sysctl.d/99-$NAME-swap.conf
+NGINX_MAP=/etc/nginx/conf.d/$NAME-logs.conf
+NGINX_VAR=optimize_for_ssd_loggable
+APACHE_CONF_NAME=$NAME-logs
+APACHE_SNIP=/etc/apache2/conf-available/$APACHE_CONF_NAME.conf
 
 ITEMS=(rsyslog journal ship docker weblog swap fstab trim tmp)
 declare -A DESC=(
@@ -69,10 +83,22 @@ info() { printf '%s[*]%s %s\n' "$B" "$N" "$*"; }
 ok()   { printf '%s[ok]%s %s\n' "$G" "$N" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$Y" "$N" "$*"; }
 err()  { printf '%s[x]%s %s\n' "$R" "$N" "$*" >&2; }
-die()  { err "$*"; exit 1; }
+die()  {
+  err "$*"
+  if [[ $PHASE == ask ]]; then info "Nothing was changed."; else warn "Stopped while applying. Changed files are backed up in $BACKUP_DIR"; fi
+  exit 1
+}
+quit_clean() { echo; info "Quit - nothing was changed."; exit 0; }
+on_int() {
+  echo
+  if [[ $PHASE == ask ]]; then quit_clean; fi
+  warn "Interrupted while applying. Changed files are backed up in $BACKUP_DIR"
+  exit 130
+}
+trap on_int INT TERM
 trap 'err "failed at line $LINENO: $BASH_COMMAND"' ERR
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- helpers ----------
 has_cmd()       { command -v "$1" >/dev/null 2>&1; }
@@ -158,8 +184,11 @@ fstab_ok() {   # fstab_ok CONTENT - validate a candidate fstab
   rm -f "$tmp"; err "new fstab failed verification:"; printf '%s\n' "$out" >&2; return 1
 }
 
-# ---------- UI (whiptail, or defaults with --yes) ----------
+mb_of() { du -sm "$@" 2>/dev/null | awk '{s += $1} END {print s + 0}'; }
+
+# ---------- UI (whiptail, or saved answers with --yes) ----------
 WT_W=$(( $(tput cols 2>/dev/null || echo 80) - 6 )); ((WT_W > 100)) && WT_W=100; ((WT_W < 60)) && WT_W=60
+WT=(whiptail --title "$NAME" --cancel-button "Quit")
 
 ui_input() {   # ui_input VAR "prompt" default [regex]
   local var=$1 prompt=$2 def=$3 re=${4:-} val
@@ -168,19 +197,23 @@ ui_input() {   # ui_input VAR "prompt" default [regex]
     [[ -z $re || $val =~ $re ]] || die "invalid or missing value for $var: '$val' (set it in $CONF)"
   else
     while :; do
-      val=$(whiptail --title "optimize-for-ssd" --inputbox "$prompt" 14 "$WT_W" "$def" 3>&1 1>&2 2>&3) || die "Cancelled."
+      val=$("${WT[@]}" --inputbox "$prompt" 15 "$WT_W" "$def" 3>&1 1>&2 2>&3) || quit_clean
       [[ -z $re || $val =~ $re ]] && break
-      whiptail --title "optimize-for-ssd" --msgbox "Invalid value: '$val'" 8 60
+      whiptail --title "$NAME" --msgbox "Invalid value: '$val'" 8 60
     done
   fi
   printf -v "$var" '%s' "$val"
 }
 
-ui_yesno() {   # ui_yesno "prompt" yes|no  -> exit status
-  local prompt=$1 def=${2:-no}
+# ui_yesno "prompt" yes|no -> 0/1. During questions, Esc quits without changes.
+ui_yesno() {
+  local prompt=$1 def=${2:-no} rc=0 extra=()
   if ((ASSUME_YES)); then [[ $def == yes ]]; return; fi
-  local extra=(); [[ $def == no ]] && extra=(--defaultno)
-  whiptail --title "optimize-for-ssd" "${extra[@]}" --yesno "$prompt" 16 "$WT_W"
+  [[ $def == no ]] && extra=(--defaultno)
+  [[ $PHASE == ask ]] && prompt+="\n\n(Esc = quit without changing anything)"
+  whiptail --title "$NAME" "${extra[@]}" --yesno "$prompt" 18 "$WT_W" || rc=$?
+  if ((rc == 255)) && [[ $PHASE == ask ]]; then quit_clean; fi
+  ((rc == 0))
 }
 
 ui_radio() {   # ui_radio VAR "prompt" current tag desc [tag desc...]
@@ -190,12 +223,12 @@ ui_radio() {   # ui_radio VAR "prompt" current tag desc [tag desc...]
     if [[ $1 == "$cur" ]]; then args+=("$1" "$2" ON); else args+=("$1" "$2" OFF); fi
     shift 2
   done
-  v=$(whiptail --title "optimize-for-ssd" --radiolist "$prompt" 16 "$WT_W" 5 "${args[@]}" 3>&1 1>&2 2>&3) || die "Cancelled."
+  v=$("${WT[@]}" --radiolist "$prompt" 16 "$WT_W" 5 "${args[@]}" 3>&1 1>&2 2>&3) || quit_clean
   printf -v "$var" '%s' "$v"
 }
 
 ui_msg() {
-  if ((ASSUME_YES)); then printf '%s\n' "$1" | sed 's/^/    /'; else whiptail --title "optimize-for-ssd" --msgbox "$1" 18 "$WT_W"; fi
+  if ((ASSUME_YES)); then printf '%s\n' "$1" | sed 's/^/    /'; else whiptail --title "$NAME" --msgbox "$1" 18 "$WT_W" || true; fi
 }
 
 # ---------- state detection: each st_* prints "state|detail" (done/todo/n/a) ----------
@@ -241,8 +274,8 @@ st_docker() {
 }
 st_weblog() {
   local any=0 done=1
-  if has_cmd nginx; then any=1; grep -qs ssd_tune_loggable /etc/nginx/nginx.conf || done=0; fi
-  if has_cmd apache2ctl; then any=1; [[ -e /etc/apache2/conf-enabled/ssd-tune-logs.conf ]] || done=0; fi
+  if has_cmd nginx; then any=1; grep -qs "$NGINX_VAR" /etc/nginx/nginx.conf || done=0; fi
+  if has_cmd apache2ctl; then any=1; [[ -e /etc/apache2/conf-enabled/$APACHE_CONF_NAME.conf ]] || done=0; fi
   if ((!any)); then echo "n/a|no nginx/apache"; elif ((done)); then echo "done|buffered"; else echo "todo|unbuffered"; fi
 }
 st_swap() {
@@ -291,25 +324,83 @@ select_items() {
     esac
     args+=("$k" "${label:0:$((WT_W - 20))}" OFF)
   done
-  SELECTED=$(whiptail --title "optimize-for-ssd $VERSION - $(hostname)" --separate-output --checklist \
-    "SPACE toggles, ENTER confirms. [DONE] = already applied; tick it to re-apply.\nItems that don't apply to this VM are hidden." \
-    22 "$WT_W" 10 "${args[@]}" 3>&1 1>&2 2>&3) || die "Cancelled."
+  SELECTED=$(whiptail --title "$NAME $VERSION - $(hostname)" --ok-button "Next" --cancel-button "Quit" \
+    --separate-output --checklist \
+    "SPACE toggles, ENTER = Next. [DONE] = already applied; tick it to re-apply.\nNothing changes until you confirm the plan at the end. Quit / Esc = exit now." \
+    22 "$WT_W" 10 "${args[@]}" 3>&1 1>&2 2>&3) || quit_clean
 }
 
-# ================= apply functions =================
+# =====================================================================
+# Question phase (ask_*): only reads state and collects answers.
+# Apply phase (do_*): makes the changes.
+# =====================================================================
 
-apply_rsyslog() {
-  if ! pkg_installed rsyslog; then ok "rsyslog already removed"; return; fi
+# ---------- rsyslog ----------
+ask_rsyslog() {
+  RSYS_DO=0
+  if ! pkg_installed rsyslog; then PLAN+=("rsyslog: already removed - nothing to do"); return; fi
   local extra
   extra=$(apt-get -s purge rsyslog 2>/dev/null | awk '/^(Purg|Remv) / {print $2}' | grep -vx rsyslog || true)
   if [[ -n $extra ]]; then
-    if ! ui_yesno "Purging rsyslog would also remove:\n\n$extra\n\nContinue?" no; then warn "rsyslog: skipped"; return; fi
+    if ! ui_yesno "Purging rsyslog would also remove:\n\n$extra\n\nInclude rsyslog removal anyway?" no; then
+      PLAN+=("rsyslog: skipped (would remove other packages)"); return
+    fi
   fi
+  RSYS_DO=1
+  RSYS_DEL_OLD=no
+  if ui_yesno "Also delete rsyslog's old files (/var/log/syslog*, kern.log*, auth.log*, mail.*)?\n\nThe same logs are still in the journal (journalctl)." yes; then RSYS_DEL_OLD=yes; fi
+  PLAN+=("rsyslog: purge package$([[ $RSYS_DEL_OLD == yes ]] && echo ', delete old syslog/auth/kern/mail logs' || true)")
+}
+do_rsyslog() {
+  ((RSYS_DO)) || return 0
   run apt-get purge -y -qq rsyslog
-  if ui_yesno "Delete rsyslog's old files (/var/log/syslog*, kern.log*, auth.log*, mail.*)?\n\nThe same logs are still in the journal (journalctl)." yes; then
+  if [[ $RSYS_DEL_OLD == yes ]]; then
     run bash -c 'rm -f /var/log/syslog* /var/log/kern.log* /var/log/auth.log* /var/log/mail.log* /var/log/mail.err*'
   fi
   SUMMARY+=("rsyslog purged")
+}
+
+# ---------- journal ----------
+ask_journal() {
+  JOURNAL_DO=1
+  ui_radio JOURNAL_MODE "Where should the systemd journal live? (current: $(journal_mode_now))" "$JOURNAL_MODE" \
+    log2ram  "RAM, synced to disk every N hours + at shutdown" \
+    volatile "RAM only (pair with shipping to VictoriaLogs)" \
+    disk     "On disk, size-capped"
+  case $JOURNAL_MODE in
+    log2ram)
+      local used journal rotated jmax est
+      used=$(mb_of /var/log)
+      journal=$(mb_of /var/log/journal)
+      rotated=$(find /var/log -type f \( -name '*.gz' -o -name '*.[0-9]' \) -printf '%s\n' 2>/dev/null | awk '{s += $1} END {print int(s / 1048576)}')
+      while :; do
+        ui_input L2R_SIZE_MB "RAM size for /var/log, in MB.\n\n/var/log now: ${used}MB  (journal ${journal}MB, rotated logs ${rotated}MB)" "$L2R_SIZE_MB" '^[0-9]+$'
+        jmax=$(( L2R_SIZE_MB * 40 / 100 ))
+        if (( used <= L2R_SIZE_MB * 70 / 100 )); then L2R_VACUUM=no; break; fi
+        est=$(( used - journal - rotated + (journal < jmax ? journal : jmax) ))
+        if (( est <= L2R_SIZE_MB * 85 / 100 )) && \
+           ui_yesno "/var/log is ${used}MB - too big for ${L2R_SIZE_MB}MB.\n\nCleaning up (journal vacuumed to ${jmax}MB, rotated *.gz / *.1 logs deleted)\nbrings it to about ${est}MB.\n\nDo that cleanup as part of the plan?" yes; then
+          L2R_VACUUM=yes; break
+        fi
+        ((ASSUME_YES)) && die "/var/log (${used}MB, ~${est}MB after cleanup) won't fit in L2R_SIZE_MB=${L2R_SIZE_MB}"
+        ui_msg "/var/log needs about ${est}MB even after cleanup (or cleanup was declined).\n\nPick a bigger size."
+      done
+      ui_input L2R_SYNC_HOURS "Sync /var/log to disk every N hours (1-24).\nA crash loses logs since the last sync (shipping to VictoriaLogs covers that)." "$L2R_SYNC_HOURS" '^([1-9]|1[0-9]|2[0-4])$'
+      PLAN+=("journal: log2ram ${L2R_SIZE_MB}MB, sync every ${L2R_SYNC_HOURS}h, journal capped at ${jmax}MB$([[ $L2R_VACUUM == yes ]] && echo ', clean up /var/log first' || true) (reboot)")
+      ;;
+    volatile)
+      ui_input VOLATILE_MAX "Max RAM for the journal (e.g. 64M)" "$VOLATILE_MAX" '^[0-9]+[MG]$'
+      JOURNAL_DEL_OLD=no
+      if [[ -d /var/log/journal ]] && ui_yesno "Delete the old on-disk journal in /var/log/journal ($(mb_of /var/log/journal)MB)?" yes; then JOURNAL_DEL_OLD=yes; fi
+      PLAN+=("journal: RAM only, max $VOLATILE_MAX$([[ $JOURNAL_DEL_OLD == yes ]] && echo ', delete old on-disk journal' || true)")
+      ;;
+    disk)
+      ui_input DISK_MAX "Max disk space for the journal (e.g. 200M)" "$DISK_MAX" '^[0-9]+[MG]$'
+      PLAN+=("journal: on disk, max $DISK_MAX")
+      ;;
+    *) die "unknown JOURNAL_MODE '$JOURNAL_MODE'" ;;
+  esac
+  if pkg_installed log2ram && [[ $JOURNAL_MODE != log2ram ]]; then PLAN+=("journal: remove log2ram (reboot)"); fi
 }
 
 remove_log2ram() {
@@ -333,81 +424,77 @@ install_log2ram() {
   apt_install log2ram
 }
 
-journal_log2ram() {
-  ui_input L2R_SIZE_MB "RAM size for /var/log, in MB.\n\nCurrent /var/log usage: $(du -sh /var/log 2>/dev/null | cut -f1)" "$L2R_SIZE_MB" '^[0-9]+$'
-  ui_input L2R_SYNC_HOURS "Sync /var/log to disk every N hours (1-24).\nA crash loses logs since the last sync (shipping to VictoriaLogs covers that)." "$L2R_SYNC_HOURS" '^([1-9]|1[0-9]|2[0-4])$'
-  local jmax=$(( L2R_SIZE_MB * 40 / 100 ))M used
-  used=$(du -sm /var/log | cut -f1)
-  if (( used > L2R_SIZE_MB * 70 / 100 )); then
-    if ui_yesno "/var/log uses ${used}MB - over 70% of ${L2R_SIZE_MB}MB.\n\nVacuum the journal to $jmax and delete rotated logs (*.gz, *.1 ...)?" yes; then
-      run journalctl --vacuum-size="$jmax"
-      run find /var/log -type f \( -name '*.gz' -o -name '*.[0-9]' \) -delete
-    fi
-    used=$(du -sm /var/log | cut -f1)
-    (( DRY_RUN || used <= L2R_SIZE_MB * 85 / 100 )) || die "/var/log (${used}MB) won't fit in ${L2R_SIZE_MB}MB - pick a bigger size or clean up first"
-  fi
-  printf '[Journal]\nStorage=persistent\nSystemMaxUse=%s\nCompress=yes\n' "$jmax" | write_file "$JD"
-  run systemctl restart systemd-journald
-  install_log2ram
-  set_kv /etc/log2ram.conf SIZE "${L2R_SIZE_MB}M" USE_RSYNC true MAIL false
-  printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* 00/%s:00:00\n' "$L2R_SYNC_HOURS" | write_file "$L2R_TIMER_DROPIN"
-  run systemctl daemon-reload
-  run systemctl enable log2ram log2ram-daily.timer
-  REBOOT_REASONS+=("log2ram mounts /var/log in RAM at boot")
-  SUMMARY+=("journal: log2ram ${L2R_SIZE_MB}MB, sync every ${L2R_SYNC_HOURS}h, journal cap $jmax")
-}
-
-journal_volatile() {
-  ui_input VOLATILE_MAX "Max RAM for the journal (e.g. 64M)" "$VOLATILE_MAX" '^[0-9]+[MG]$'
-  remove_log2ram
-  printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=%s\n' "$VOLATILE_MAX" | write_file "$JD"
-  run systemctl restart systemd-journald
-  if [[ -d /var/log/journal ]] && ui_yesno "Delete the old on-disk journal in /var/log/journal ($(du -sh /var/log/journal | cut -f1))?" yes; then
-    run rm -rf /var/log/journal
-  fi
-  if [[ ! -f $UPLOAD_DROPIN ]]; then warn "RAM-only journal: logs vanish on reboot unless you also select 'ship'"; fi
-  SUMMARY+=("journal: RAM only, max $VOLATILE_MAX")
-}
-
-journal_disk() {
-  ui_input DISK_MAX "Max disk space for the journal (e.g. 200M)" "$DISK_MAX" '^[0-9]+[MG]$'
-  remove_log2ram
-  printf '[Journal]\nStorage=persistent\nSystemMaxUse=%s\nCompress=yes\n' "$DISK_MAX" | write_file "$JD"
-  run mkdir -p /var/log/journal
-  run systemd-tmpfiles --create --prefix /var/log/journal
-  run systemctl restart systemd-journald
-  run journalctl --flush
-  run journalctl --vacuum-size="$DISK_MAX"
-  SUMMARY+=("journal: on disk, max $DISK_MAX")
-}
-
-apply_journal() {
-  local cur; cur=$(journal_mode_now)
-  ui_radio JOURNAL_MODE "Where should the systemd journal live? (current: $cur)" "$JOURNAL_MODE" \
-    log2ram  "RAM, synced to disk every N hours + at shutdown" \
-    volatile "RAM only (pair with shipping to VictoriaLogs)" \
-    disk     "On disk, size-capped"
+do_journal() {
+  ((JOURNAL_DO)) || return 0
   case $JOURNAL_MODE in
-    log2ram)  journal_log2ram ;;
-    volatile) journal_volatile ;;
-    disk)     journal_disk ;;
-    *) die "unknown JOURNAL_MODE '$JOURNAL_MODE'" ;;
+    log2ram)
+      local jmax=$(( L2R_SIZE_MB * 40 / 100 ))M used
+      if [[ $L2R_VACUUM == yes ]]; then
+        run journalctl --vacuum-size="$jmax"
+        run find /var/log -type f \( -name '*.gz' -o -name '*.[0-9]' \) -delete
+      fi
+      printf '[Journal]\nStorage=persistent\nSystemMaxUse=%s\nCompress=yes\n' "$jmax" | write_file "$JD"
+      run systemctl restart systemd-journald
+      used=$(mb_of /var/log)
+      if ((!DRY_RUN)) && (( used > L2R_SIZE_MB * 85 / 100 )); then
+        warn "/var/log is still ${used}MB - too big for ${L2R_SIZE_MB}MB. Journal is capped, but log2ram was NOT installed."
+        SUMMARY+=("journal: capped at $jmax (log2ram skipped - /var/log too big)")
+        return
+      fi
+      install_log2ram
+      set_kv /etc/log2ram.conf SIZE "${L2R_SIZE_MB}M" USE_RSYNC true MAIL false
+      printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* 00/%s:00:00\n' "$L2R_SYNC_HOURS" | write_file "$L2R_TIMER_DROPIN"
+      run systemctl daemon-reload
+      run systemctl enable log2ram log2ram-daily.timer
+      REBOOT_REASONS+=("log2ram mounts /var/log in RAM at boot")
+      SUMMARY+=("journal: log2ram ${L2R_SIZE_MB}MB, sync every ${L2R_SYNC_HOURS}h, journal cap $jmax")
+      ;;
+    volatile)
+      remove_log2ram
+      printf '[Journal]\nStorage=volatile\nRuntimeMaxUse=%s\n' "$VOLATILE_MAX" | write_file "$JD"
+      run systemctl restart systemd-journald
+      if [[ $JOURNAL_DEL_OLD == yes ]]; then run rm -rf /var/log/journal; fi
+      if [[ ! -f $UPLOAD_DROPIN && $SHIP_DO -eq 0 ]]; then warn "RAM-only journal: logs vanish on reboot unless you also ship them"; fi
+      SUMMARY+=("journal: RAM only, max $VOLATILE_MAX")
+      ;;
+    disk)
+      remove_log2ram
+      printf '[Journal]\nStorage=persistent\nSystemMaxUse=%s\nCompress=yes\n' "$DISK_MAX" | write_file "$JD"
+      run mkdir -p /var/log/journal
+      run systemd-tmpfiles --create --prefix /var/log/journal
+      run systemctl restart systemd-journald
+      run journalctl --flush
+      run journalctl --vacuum-size="$DISK_MAX"
+      SUMMARY+=("journal: on disk, max $DISK_MAX")
+      ;;
   esac
 }
 
-apply_ship() {
-  local def=$VLOGS_URL base tag
+# ---------- ship ----------
+ask_ship() {
+  SHIP_DO=1
+  local def=$VLOGS_URL base curl_ca=()
   ((ASSUME_YES)) || def=${def:-http://192.168.1.6:9428/insert/journald}
   ui_input VLOGS_URL "VictoriaLogs journald endpoint:" "$def" '^https?://[^/]+/.+$'
-  ui_input VLOGS_CA "CA certificate file for HTTPS (e.g. your step-ca root).\nLeave empty for plain http or a publicly trusted cert." "$VLOGS_CA" ''
-  if [[ -n $VLOGS_CA && ! -f $VLOGS_CA ]]; then die "CA file $VLOGS_CA not found"; fi
+  while :; do
+    ui_input VLOGS_CA "CA certificate file for HTTPS (e.g. your step-ca root).\nLeave empty for plain http or a publicly trusted cert." "$VLOGS_CA" ''
+    [[ -z $VLOGS_CA || -f $VLOGS_CA ]] && break
+    ((ASSUME_YES)) && die "CA file $VLOGS_CA not found"
+    ui_msg "File not found: $VLOGS_CA"
+  done
   base=${VLOGS_URL%%/insert/*}
-  local curl_ca=(); [[ -n $VLOGS_CA ]] && curl_ca=(--cacert "$VLOGS_CA")
+  if [[ -n $VLOGS_CA ]]; then curl_ca=(--cacert "$VLOGS_CA"); fi
   if ! curl -fsS --max-time 5 "${curl_ca[@]}" "$base/health" >/dev/null 2>&1; then
-    if ! ui_yesno "Can't reach $base/health from this VM.\n(firewall? IPsec rule? wrong IP?)\n\nConfigure anyway? journal-upload will retry and catch up later." no; then
-      warn "ship: skipped"; return
+    if ! ui_yesno "Can't reach $base/health from this VM.\n(firewall? IPsec rule? wrong IP?)\n\nConfigure shipping anyway? journal-upload retries and catches up later." no; then
+      SHIP_DO=0; PLAN+=("ship: skipped (VictoriaLogs unreachable)"); return
     fi
   fi
+  PLAN+=("ship: systemd-journal-upload -> $VLOGS_URL")
+}
+do_ship() {
+  ((SHIP_DO)) || return 0
+  local base=${VLOGS_URL%%/insert/*} curl_ca=() tag
+  if [[ -n $VLOGS_CA ]]; then curl_ca=(--cacert "$VLOGS_CA"); fi
   apt_install systemd-journal-remote
   {
     echo "[Upload]"
@@ -417,8 +504,8 @@ apply_ship() {
   run systemctl enable systemd-journal-upload
   run systemctl restart systemd-journal-upload
   if ((!DRY_RUN)); then
-    tag="ssd-tune-test-$(hostname)-$RANDOM"
-    logger -t ssd-tune "$tag"
+    tag="$NAME-test-$(hostname)-$RANDOM"
+    logger -t "$NAME" "$tag"
     info "sent test line '$tag', checking it arrived..."
     sleep 6
     if curl -fsS --max-time 10 "${curl_ca[@]}" "$base/select/logsql/query" --data-urlencode "query=_time:5m \"$tag\"" 2>/dev/null | grep -q "$tag"; then
@@ -430,11 +517,21 @@ apply_ship() {
   SUMMARY+=("shipping journal -> $VLOGS_URL")
 }
 
-apply_docker() {
-  if ! docker_present; then warn "docker not installed - skipping"; return; fi
+# ---------- docker ----------
+ask_docker() {
+  DOCKER_DO=0
+  if ! docker_present; then PLAN+=("docker: skipped (docker not installed)"); return; fi
+  DOCKER_DO=1
   ui_radio DOCKER_DRIVER "Default log driver for new containers:" "$DOCKER_DRIVER" \
     journald "into the journal (log2ram'd / shipped with everything)" \
     local    "compressed local files, 10M x 3 per container"
+  if ui_yesno "Restart Docker after changing daemon.json?\n(containers with a restart policy come back automatically)" "$DOCKER_RESTART"; then DOCKER_RESTART=yes; else DOCKER_RESTART=no; fi
+  DOCKER_RECREATE=no
+  if [[ $DOCKER_RESTART == yes ]] && ui_yesno "Existing containers keep their old log driver until recreated.\n\nRecreate all docker compose projects too? (brief downtime)" no; then DOCKER_RECREATE=yes; fi
+  PLAN+=("docker: log-driver $DOCKER_DRIVER, restart docker: $DOCKER_RESTART, recreate compose projects: $DOCKER_RECREATE")
+}
+do_docker() {
+  ((DOCKER_DO)) || return 0
   local new tmp
   new=$(python3 - "$DOCKER_JSON" "$DOCKER_DRIVER" <<'PY'
 import json, os, sys
@@ -447,21 +544,17 @@ cfg["log-driver"] = drv
 cfg["log-opts"] = {"tag": "{{.Name}}"} if drv == "journald" else {"max-size": "10m", "max-file": "3"}
 print(json.dumps(cfg, indent=2))
 PY
-) || die "could not parse $DOCKER_JSON"
+) || { warn "could not parse $DOCKER_JSON - docker skipped"; return; }
   tmp=$(mktemp); printf '%s\n' "$new" >"$tmp"
   if dockerd --help 2>&1 | grep -q -- '--validate'; then
-    dockerd --validate --config-file "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "new daemon.json failed 'dockerd --validate'"; }
+    if ! dockerd --validate --config-file "$tmp" >/dev/null 2>&1; then rm -f "$tmp"; warn "new daemon.json failed validation - docker skipped"; return; fi
   fi
   rm -f "$tmp"
   printf '%s\n' "$new" | write_file "$DOCKER_JSON"
-  if ui_yesno "Restart Docker now so the new default applies?\n(containers with a restart policy come back automatically)" yes; then
-    run systemctl restart docker
-  else
-    REBOOT_REASONS+=("docker restart needed for the new log driver")
-  fi
+  if [[ $DOCKER_RESTART == yes ]]; then run systemctl restart docker
+  else REBOOT_REASONS+=("docker restart needed for the new log driver"); fi
 
-  if ui_yesno "Existing containers keep their old log driver until recreated.\n\nRecreate all docker compose projects now? (brief downtime)" "$DOCKER_RECREATE"; then
-    DOCKER_RECREATE=yes
+  if [[ $DOCKER_RECREATE == yes ]]; then
     local name files fl f args
     while IFS=$'\t' read -r name files; do
       [[ -n $name ]] || continue
@@ -472,8 +565,7 @@ PY
     done < <(docker compose ls --all --format json 2>/dev/null \
              | python3 -c 'import json,sys; [print(p["Name"]+"\t"+p["ConfigFiles"]) for p in json.load(sys.stdin)]' || true)
   else
-    DOCKER_RECREATE=no
-    warn "remember: docker compose up -d --force-recreate in each project"
+    warn "existing containers: run 'docker compose up -d --force-recreate' in each project to switch them"
   fi
   local loose
   loose=$(docker ps -a --format '{{.Names}}|{{.Label "com.docker.compose.project"}}' 2>/dev/null | awk -F'|' '$2=="" {print $1}' || true)
@@ -481,21 +573,26 @@ PY
   SUMMARY+=("docker log-driver: $DOCKER_DRIVER")
 }
 
+# ---------- weblog ----------
+ask_weblog() {
+  if has_cmd nginx; then PLAN+=("weblog: nginx - buffered access log (64k / 5 min), static assets not logged"); fi
+  if has_cmd apache2ctl; then PLAN+=("weblog: apache - BufferedLogs On, static assets not logged"); fi
+}
 weblog_nginx() {
   local conf=/etc/nginx/nginx.conf
-  cat <<'EOF' | write_file "$NGINX_MAP"
-# ssd-tune: don't write access-log lines for static assets
-map $request_uri $ssd_tune_loggable {
-    ~*\.(css|js|mjs|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|map)(\?.*)?$ 0;
+  write_file "$NGINX_MAP" <<EOF
+# $NAME: don't write access-log lines for static assets
+map \$request_uri \$$NGINX_VAR {
+    ~*\\.(css|js|mjs|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|map)(\\?.*)?\$ 0;
     default 1;
 }
 EOF
-  if ! grep -q ssd_tune_loggable "$conf"; then
+  if ! grep -q "$NGINX_VAR" "$conf"; then
     if grep -Eq '^\s*access_log\s+/var/log/nginx/access\.log\s*;' "$conf"; then
-      sed -E 's#^(\s*)access_log\s+/var/log/nginx/access\.log\s*;#\1access_log /var/log/nginx/access.log combined buffer=64k flush=5m if=$ssd_tune_loggable;#' "$conf" \
+      sed -E "s#^(\\s*)access_log\\s+/var/log/nginx/access\\.log\\s*;#\\1access_log /var/log/nginx/access.log combined buffer=64k flush=5m if=\$$NGINX_VAR;#" "$conf" \
         | write_file "$conf"
     else
-      warn "nginx.conf has a non-default access_log line - not changed. Add: buffer=64k flush=5m if=\$ssd_tune_loggable"
+      warn "nginx.conf has a non-default access_log line - not changed. Add: buffer=64k flush=5m if=\$$NGINX_VAR"
     fi
   fi
   if ((!DRY_RUN)); then
@@ -504,15 +601,14 @@ EOF
   fi
   local own
   own=$(grep -ls '^\s*access_log' /etc/nginx/sites-enabled/* 2>/dev/null || true)
-  if [[ -n $own ]]; then warn "these sites set their own access_log (not buffered - add 'buffer=64k flush=5m if=\$ssd_tune_loggable'):"; echo "$own" | sed 's/^/      /'; fi
+  if [[ -n $own ]]; then warn "these sites set their own access_log (not buffered - add 'buffer=64k flush=5m if=\$$NGINX_VAR'):"; echo "$own" | sed 's/^/      /'; fi
   SUMMARY+=("nginx: buffered access log, static assets skipped")
 }
-
 weblog_apache() {
-  cat <<'EOF' | write_file "$APACHE_SNIP"
-# ssd-tune: buffer access-log writes, skip static assets
+  write_file "$APACHE_SNIP" <<EOF
+# $NAME: buffer access-log writes, skip static assets
 BufferedLogs On
-SetEnvIfNoCase Request_URI "\.(css|js|mjs|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|map)$" dontlog
+SetEnvIfNoCase Request_URI "\\.(css|js|mjs|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|map)\$" dontlog
 EOF
   local f changed=()
   for f in /etc/apache2/sites-enabled/*.conf /etc/apache2/conf-enabled/*.conf; do
@@ -524,12 +620,12 @@ EOF
       changed+=("$f")
     fi
   done
-  run a2enconf -q ssd-tune-logs
+  run a2enconf -q "$APACHE_CONF_NAME"
   if ((!DRY_RUN)); then
     if apache2ctl configtest >/dev/null 2>&1; then run systemctl reload apache2; ok "apache reloaded"
     else
       err "apache2ctl configtest failed - rolling back"
-      a2disconf -q ssd-tune-logs || true
+      a2disconf -q "$APACHE_CONF_NAME" || true
       restore_file "$APACHE_SNIP"
       for f in "${changed[@]}"; do restore_file "$f"; done
       return
@@ -537,16 +633,41 @@ EOF
   fi
   SUMMARY+=("apache: BufferedLogs on, static assets skipped (${#changed[@]} files edited)")
 }
-
-apply_weblog() {
-  local did=0
-  if has_cmd nginx; then weblog_nginx; did=1; fi
-  if has_cmd apache2ctl; then weblog_apache; did=1; fi
-  if ((!did)); then warn "no nginx/apache found - skipping"; fi
+do_weblog() {
+  if has_cmd nginx; then weblog_nginx; fi
+  if has_cmd apache2ctl; then weblog_apache; fi
 }
 
+# ---------- swap ----------
+ask_swap() {
+  SWAP_DO=1
+  ui_radio SWAP_MODE "Swap strategy (current: $(swap_mode_now)):" "$SWAP_MODE" \
+    zram       "compressed swap in RAM; disk swap removed" \
+    swappiness "keep disk swap, just swap less"
+  if [[ $SWAP_MODE == zram ]] && ! modprobe -n zram >/dev/null 2>&1; then
+    if ui_yesno "Kernel $(uname -r) has no zram module\n(fix: apt install linux-modules-extra-$(uname -r), or use the generic kernel).\n\nJust lower swappiness instead (keep disk swap)?" yes; then
+      SWAP_MODE=swappiness
+    else
+      SWAP_DO=0; PLAN+=("swap: skipped (no zram module)"); return
+    fi
+  fi
+  case $SWAP_MODE in
+    zram)
+      ui_input ZRAM_PERCENT "zram swap size as % of RAM (RAM: $(free -h | awk '/^Mem:/ {print $2}'))" "$ZRAM_PERCENT" '^([1-9][0-9]?|100)$'
+      ui_radio ZRAM_ALGO "zram compression:" "$ZRAM_ALGO" zstd "best ratio (recommended)" lz4 "fastest" lzo-rle "kernel default"
+      ui_input SWAPPINESS_ZRAM "vm.swappiness with zram only (zram is cheap: 100-180 is normal)" "$SWAPPINESS_ZRAM" '^([0-9]|[1-9][0-9]|1[0-9][0-9]|200)$'
+      local disk; disk=$(swap_disk_list | tr '\n' ' ')
+      PLAN+=("swap: zram ${ZRAM_PERCENT}% $ZRAM_ALGO, swappiness=$SWAPPINESS_ZRAM, remove disk swap: ${disk:-none}")
+      ;;
+    swappiness)
+      ui_input SWAPPINESS_DISK "vm.swappiness with disk swap (lower = swap less; 10 is typical)" "$SWAPPINESS_DISK" '^([0-9]|[1-9][0-9]|100)$'
+      PLAN+=("swap: keep disk swap, swappiness=$SWAPPINESS_DISK")
+      ;;
+    *) die "unknown SWAP_MODE '$SWAP_MODE'" ;;
+  esac
+}
 remove_disk_swap() {
-  local name type used avail rm_files=() f
+  local name type used avail rm_files=() f new
   avail=$(awk '/^MemAvailable:/ {print $2 * 1024}' /proc/meminfo)
   while read -r name type used; do
     [[ -z $name || $name == /dev/zram* ]] && continue
@@ -557,65 +678,54 @@ remove_disk_swap() {
   done < <(swapon --show=NAME,TYPE,USED --bytes --noheadings --raw 2>/dev/null || true)
 
   while read -r f; do [[ -f $f ]] && rm_files+=("$f"); done < <(awk '$1 !~ /^#/ && $3 == "swap" {print $1}' /etc/fstab)
-  local new
-  new=$(awk '$1 !~ /^#/ && $3 == "swap" {print "# ssd-tune disabled: " $0; next} {print}' /etc/fstab)
-  fstab_ok "$new" || die "not touching fstab"
+  new=$(awk -v n="$NAME" '$1 !~ /^#/ && $3 == "swap" {print "# " n " disabled: " $0; next} {print}' /etc/fstab)
+  fstab_ok "$new" || { warn "fstab not changed (verification failed)"; return; }
   printf '%s\n' "$new" | write_file /etc/fstab
   run systemctl daemon-reload
   for f in $(printf '%s\n' "${rm_files[@]}" | sort -u); do
     if ! swapon --show=NAME --noheadings --raw | grep -qx "$f"; then info "removing $f"; run rm -f "$f"; fi
   done
 }
-
-swap_zram() {
-  if ! modprobe -n zram >/dev/null 2>&1; then
-    warn "kernel $(uname -r) has no zram module (try: apt install linux-modules-extra-$(uname -r), or the generic kernel)"
-    if ui_yesno "zram isn't available on this kernel.\n\nJust lower swappiness instead (keep disk swap)?" yes; then SWAP_MODE=swappiness; swap_swappiness; fi
-    return
-  fi
-  if [[ -f /etc/systemd/zram-generator.conf ]]; then warn "zram-generator config found - may conflict with zram-tools"; fi
-  ui_input ZRAM_PERCENT "zram swap size as % of RAM (RAM: $(free -h | awk '/^Mem:/ {print $2}'))" "$ZRAM_PERCENT" '^([1-9][0-9]?|100)$'
-  ui_radio ZRAM_ALGO "zram compression:" "$ZRAM_ALGO" zstd "best ratio (recommended)" lz4 "fastest" lzo-rle "kernel default"
-  ui_input SWAPPINESS_ZRAM "vm.swappiness with zram only (zram is cheap: 100-180 is normal)" "$SWAPPINESS_ZRAM" '^([0-9]|[1-9][0-9]|1[0-9][0-9]|200)$'
-  apt_install zram-tools
-  set_kv /etc/default/zramswap ALGO "$ZRAM_ALGO" PERCENT "$ZRAM_PERCENT" PRIORITY 100
-  run systemctl enable zramswap
-  run systemctl restart zramswap
-  if ((!DRY_RUN)) && ! zram_active; then die "zram swap didn't come up - disk swap left untouched (check: systemctl status zramswap)"; fi
-  remove_disk_swap
-  printf 'vm.swappiness=%s\n' "$SWAPPINESS_ZRAM" | write_file "$SWAP_SYSCTL"
-  run sysctl -q -w "vm.swappiness=$SWAPPINESS_ZRAM"
-  SUMMARY+=("swap: zram ${ZRAM_PERCENT}% $ZRAM_ALGO, disk swap removed, swappiness=$SWAPPINESS_ZRAM")
-}
-
-swap_swappiness() {
-  ui_input SWAPPINESS_DISK "vm.swappiness with disk swap (lower = swap less; 10 is typical)" "$SWAPPINESS_DISK" '^([0-9]|[1-9][0-9]|100)$'
-  printf 'vm.swappiness=%s\n' "$SWAPPINESS_DISK" | write_file "$SWAP_SYSCTL"
-  run sysctl -q -w "vm.swappiness=$SWAPPINESS_DISK"
-  SUMMARY+=("swap: kept disk swap, swappiness=$SWAPPINESS_DISK")
-}
-
-apply_swap() {
-  ui_radio SWAP_MODE "Swap strategy (current: $(swap_mode_now)):" "$SWAP_MODE" \
-    zram       "compressed swap in RAM; disk swap file removed" \
-    swappiness "keep disk swap, just swap less"
+do_swap() {
+  ((SWAP_DO)) || return 0
   case $SWAP_MODE in
-    zram)       swap_zram ;;
-    swappiness) swap_swappiness ;;
-    *) die "unknown SWAP_MODE '$SWAP_MODE'" ;;
+    zram)
+      if [[ -f /etc/systemd/zram-generator.conf ]]; then warn "zram-generator config found - may conflict with zram-tools"; fi
+      apt_install zram-tools
+      set_kv /etc/default/zramswap ALGO "$ZRAM_ALGO" PERCENT "$ZRAM_PERCENT" PRIORITY 100
+      run systemctl enable zramswap
+      run systemctl restart zramswap
+      if ((!DRY_RUN)) && ! zram_active; then warn "zram swap didn't come up - disk swap left untouched (systemctl status zramswap)"; return; fi
+      remove_disk_swap
+      printf 'vm.swappiness=%s\n' "$SWAPPINESS_ZRAM" | write_file "$SWAP_SYSCTL"
+      run sysctl -q -w "vm.swappiness=$SWAPPINESS_ZRAM"
+      SUMMARY+=("swap: zram ${ZRAM_PERCENT}% $ZRAM_ALGO, disk swap removed, swappiness=$SWAPPINESS_ZRAM")
+      ;;
+    swappiness)
+      printf 'vm.swappiness=%s\n' "$SWAPPINESS_DISK" | write_file "$SWAP_SYSCTL"
+      run sysctl -q -w "vm.swappiness=$SWAPPINESS_DISK"
+      SUMMARY+=("swap: kept disk swap, swappiness=$SWAPPINESS_DISK")
+      ;;
   esac
 }
 
-apply_fstab() {
-  local fs e4=0 new
-  fs=$(findmnt -no FSTYPE /)
-  [[ -n $(root_fstab_opts) ]] || { warn "no / entry in /etc/fstab - skipping"; return; }
+# ---------- fstab (root fs options) ----------
+ask_fstab() {
+  FSTAB_DO=0
+  local fs; fs=$(findmnt -no FSTYPE /)
+  if [[ -z $(root_fstab_opts) ]]; then PLAN+=("fstab: skipped (no / entry in /etc/fstab)"); return; fi
+  FSTAB_DO=1
   if [[ $fs == ext4 ]]; then
-    e4=1
     ui_input COMMIT_SEC "ext4 commit interval in seconds (kernel default 5).\n\nHigher = fewer metadata flushes. On a crash, up to this many seconds of\nwrites that apps didn't fsync can be lost (databases fsync, so they're safe)." "$COMMIT_SEC" '^[0-9]+$'
+    PLAN+=("fstab: root (/) gets noatime,commit=$COMMIT_SEC, remounted live")
   else
-    warn "root is $fs, not ext4 - only adding noatime"
+    PLAN+=("fstab: root (/) is $fs - gets noatime only, remounted live")
   fi
+}
+do_fstab() {
+  ((FSTAB_DO)) || return 0
+  local fs e4=0 new
+  fs=$(findmnt -no FSTYPE /); [[ $fs == ext4 ]] && e4=1
   new=$(awk -v c="$COMMIT_SEC" -v e4="$e4" '
     $1 !~ /^#/ && $2 == "/" {
       n = split($4, o, ","); out = ""
@@ -628,17 +738,22 @@ apply_fstab() {
       $4 = out
     }
     { print }' /etc/fstab)
-  fstab_ok "$new" || die "not touching fstab"
+  fstab_ok "$new" || { warn "fstab not changed (verification failed)"; return; }
   printf '%s\n' "$new" | write_file /etc/fstab
   run systemctl daemon-reload
-  if ! run mount -o remount /; then restore_file /etc/fstab; run systemctl daemon-reload; die "remount failed - fstab restored"; fi
+  if ! run mount -o remount /; then
+    restore_file /etc/fstab; run systemctl daemon-reload
+    warn "remount failed - fstab restored"; return
+  fi
   ((DRY_RUN)) || ok "root mounted with: $(findmnt -no OPTIONS /)"
-  SUMMARY+=("root fs: noatime$( ((e4)) && echo ",commit=$COMMIT_SEC")")
+  SUMMARY+=("root fs: noatime$( ((e4)) && echo ",commit=$COMMIT_SEC" || true)")
 }
 
-apply_trim() {
+# ---------- trim ----------
+ask_trim() { PLAN+=("trim: enable fstrim.timer and test TRIM on /"); }
+do_trim() {
   run systemctl enable --now fstrim.timer
-  ((DRY_RUN)) && return
+  ((DRY_RUN)) && return 0
   local out
   if out=$(fstrim -v / 2>&1); then
     ok "TRIM works - $out"
@@ -656,13 +771,17 @@ enough), and run this item again."
   fi
 }
 
-apply_tmp() {
+# ---------- tmp ----------
+ask_tmp() {
   ui_input TMP_SIZE "Size cap for /tmp (e.g. 512M, 1G).\nRAM is only used as files are written. RAM: $(free -h | awk '/^Mem:/ {print $2}')" "$TMP_SIZE" '^[0-9]+[MG]$'
+  PLAN+=("tmp: /tmp as tmpfs, size=$TMP_SIZE$([[ $(findmnt -no FSTYPE /tmp 2>/dev/null) == tmpfs ]] && echo ' (resize live)' || echo ' (reboot)')")
+}
+do_tmp() {
   if [[ $(systemctl is-enabled tmp.mount 2>/dev/null || true) == masked ]]; then run systemctl unmask tmp.mount; fi
   local new
   new=$(awk '!($1 !~ /^#/ && $2 == "/tmp")' /etc/fstab
         echo "tmpfs  /tmp  tmpfs  defaults,noatime,nosuid,nodev,mode=1777,size=$TMP_SIZE  0  0")
-  fstab_ok "$new" || die "not touching fstab"
+  fstab_ok "$new" || { warn "fstab not changed (verification failed)"; return; }
   printf '%s\n' "$new" | write_file /etc/fstab
   run systemctl daemon-reload
   if [[ $(findmnt -no FSTYPE /tmp 2>/dev/null) == tmpfs ]]; then
@@ -687,7 +806,7 @@ save_conf() {
   ((DRY_RUN)) && return 0
   local v
   {
-    echo "# ssd-tune answers - saved $(date '+%F %T') on $(hostname)"
+    echo "# $NAME answers - saved $(date '+%F %T') on $(hostname)"
     for v in "${CONF_VARS[@]}"; do printf '%s=%q\n' "$v" "${!v}"; done
   } >"$CONF"
   chmod 600 "$CONF"
@@ -700,6 +819,19 @@ check_os() {
     ((FORCE)) || die "made for Ubuntu 24.04/26.04 LTS, found ${PRETTY_NAME:-unknown}. Use --force to run anyway."
     warn "running on ${PRETTY_NAME:-unknown} (--force)"
   fi
+}
+
+confirm_plan() {
+  local text p
+  text="$( ((DRY_RUN)) && echo 'DRY RUN - nothing will actually change.' || true)
+$(hostname) - this is what will happen:
+
+"
+  for p in "${PLAN[@]}"; do text+=" * $p"$'\n'; done
+  text+=$'\nChanged files are backed up to '"$BACKUP_DIR"$'\n'
+  if ((ASSUME_YES)); then printf '%s\n' "$text"; return 0; fi
+  whiptail --title "$NAME - review plan" --scrolltext --yes-button "Apply" --no-button "Quit" \
+    --yesno "$text" 24 "$WT_W" || quit_clean
 }
 
 main() {
@@ -719,8 +851,8 @@ main() {
 
   [[ $EUID -eq 0 ]] || die "run as root: sudo $0 $*"
   check_os
-  exec 9>/run/ssd-tune.lock
-  flock -n 9 || die "another optimize-for-ssd is running"
+  exec 9>"/run/$NAME.lock"
+  flock -n 9 || die "another $NAME is running"
   load_conf
 
   if ((STATUS_ONLY)); then print_status; exit 0; fi
@@ -734,18 +866,27 @@ main() {
     if ! has_cmd whiptail; then apt-get install -y -qq whiptail >/dev/null; fi
     select_items
   fi
-  [[ -n ${SELECTED//[[:space:]]/} ]] || { info "nothing selected"; exit 0; }
-  ((DRY_RUN)) && warn "DRY RUN - nothing will be changed"
+  [[ -n ${SELECTED//[[:space:]]/} ]] || quit_clean
 
+  # 1) questions only - nothing changes here
+  for k in "${ITEMS[@]}"; do
+    if grep -qx "$k" <<<"$SELECTED"; then "ask_$k"; fi
+  done
+  ((${#PLAN[@]})) || quit_clean
+  confirm_plan
+
+  # 2) apply
+  PHASE=apply
+  ((DRY_RUN)) && warn "DRY RUN - nothing will be changed"
   for k in "${ITEMS[@]}"; do
     if grep -qx "$k" <<<"$SELECTED"; then
       echo; info "${B}-- $k: ${DESC[$k]}${N}"
-      "apply_$k"
+      "do_$k"
     fi
   done
 
   save_conf
-  echo; info "Summary$( ((DRY_RUN)) && echo ' (dry run - what would be done)')"
+  echo; info "Summary$( ((DRY_RUN)) && echo ' (dry run - what would be done)' || true)"
   for k in "${SUMMARY[@]}"; do ok "$k"; done
   ((DRY_RUN)) || print_status
   if [[ -d $BACKUP_DIR ]]; then info "backups of changed files: $BACKUP_DIR"; fi
