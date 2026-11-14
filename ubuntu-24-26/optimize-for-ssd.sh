@@ -553,7 +553,7 @@ do_journal() {
 ask_ship() {
   SHIP_DO=1
   local def=$VLOGS_URL base curl_tls=() code
-  ((ASSUME_YES)) || def=${def:-https://192.168.1.6:9443/insert/journald}
+  ((ASSUME_YES)) || def=${def:-https://127.0.0.1:80/insert/journald}
   ui_input VLOGS_URL "VictoriaLogs journald endpoint:" "$def" '^https?://[^/]+/.+$'
   if [[ $VLOGS_URL == https://* ]]; then
     while :; do

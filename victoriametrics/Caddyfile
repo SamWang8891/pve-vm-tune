@@ -1,0 +1,59 @@
+#   @insert_allowed - machines that may SEND logs   (/insert/*)
+#   @read_allowed   - machines that may READ logs   (/select/*, incl. the web UI)
+# Anything else gets 403. After editing: docker restart victorialogs-proxy
+#
+# Inside its container Caddy always listens on port 80, and speaks HTTPS there, not plain HTTP.
+# The outside port is set in docker-compose.yaml ("80:80"); to move it, change only that file.
+# 127.0.0.1 is the name on the certificate. If the VMs verify the certificate
+# (VLOGS_CA=/path/to/root.crt), replace it with the address they connect to.
+
+{
+        admin off
+        https_port 80                    # port 80 is the HTTPS port in here...
+        http_port 8080                   # ...so plain HTTP moves out of the way (nothing listens on 8080)
+        auto_https disable_redirects
+        skip_install_trust
+        default_sni 127.0.0.1            # clients connecting by IP send no SNI
+        fallback_sni 127.0.0.1           # clients connecting by a host name get the same cert
+        servers :80 {
+                protocols h1             # journal-upload breaks over HTTP/2 (systemd #39166)
+        }
+}
+
+# 127.0.0.1 = name on the cert; :80 = also answer requests for any other host name
+127.0.0.1, :80 {
+        tls internal                     # self-signed cert, issued by Caddy's own CA
+
+        # --- health check, open (Uptime Kuma / blackbox) ---
+        handle /health {
+                reverse_proxy victorialogs:9428
+        }
+
+        # --- ingest: only these source IPs, only /insert/* ---
+        @insert_allowed {
+                path /insert/*
+                remote_ip <IP or Subnet>
+        }
+        handle @insert_allowed {
+                reverse_proxy victorialogs:9428
+        }
+
+        # --- read: web UI + query API, only these source IPs ---
+        @read_allowed {
+                path /select/*
+                remote_ip <IP or Subnet>
+        }
+        handle @read_allowed {
+                reverse_proxy victorialogs:9428
+        }
+
+        # --- everything else ---
+        # 403 when it should be allowed? Show which IP Caddy sees: respond "forbidden: {remote_host}" 403
+        handle {
+                respond "forbidden" 403
+        }
+
+        log {
+                output discard           # don't write per-request logs to the NAS
+        }
+}

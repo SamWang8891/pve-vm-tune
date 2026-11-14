@@ -1,0 +1,62 @@
+# VictoriaLogs log receiver + Caddy auth/TLS proxy - Synology DS918+ (Container Manager)
+#
+#   journald ingest : https://127.0.0.1:80/insert/journald   (only from IPs allowed in Caddyfile)
+#   web UI          : https://127.0.0.1:80/select/vmui       (only from IPs allowed in Caddyfile)
+#   Grafana         : VictoriaLogs data source, URL https://127.0.0.1:80, "Skip TLS verify" on
+#   syslog          : 127.0.0.1:5514 tcp/udp (plain - restrict with DSM firewall)
+#
+#   127.0.0.1 = this host's address, 80 = the proxy's outside port (see "ports" below).
+#   It's HTTPS on port 80, so write ":80" out in URLs - "https://" alone means 443.
+#
+# Project folder layout (paths below are relative to this docker-compose.yaml):
+#   ./docker-compose.yaml
+#   ./Caddyfile
+#   ./victorialogs/   VictoriaLogs data  (create before first start)
+#   ./data/           Caddy's CA + cert  (create before first start)
+
+services:
+  victorialogs:
+    image: victoriametrics/victoria-logs:v1.53.0   # pin; check github.com/VictoriaMetrics/VictoriaLogs/releases
+    container_name: victorialogs
+    command:
+      - -storageDataPath=/vlogs
+      - -httpListenAddr=:9428
+      - -retentionPeriod=180d                       # keep logs this long...
+      - -retention.maxDiskSpaceUsageBytes=150GiB    # ...or until this size, oldest dropped first
+      - -syslog.listenAddr.tcp=:5514
+      - -syslog.listenAddr.udp=:5514
+    volumes:
+      - ./victorialogs:/vlogs
+    ports:
+      # the HTTP API (9428) is not published: only the proxy reaches it, over the compose network
+      - "5514:5514/tcp"         # syslog (514 is used by DSM's own syslog server)
+      - "5514:5514/udp"
+    mem_limit: 1g
+    cpu_shares: 512             # lower priority than DSM under load (DSM's kernel has no CFS quota, so no "cpus:")
+    stop_grace_period: 30s      # time to flush in-memory data on restart
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  proxy:
+    image: caddy:2
+    container_name: victorialogs-proxy
+    ports:
+      # outside:inside. Caddy always listens on 80 inside - to move it, change only the left side,
+      # e.g. "9443:80". Synology: DSM itself holds 80 and 443, so pick another outside port there.
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data:/data   # keeps its self-signed CA/cert across restarts
+    mem_limit: 128m
+    restart: unless-stopped
+    depends_on:
+      - victorialogs
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
